@@ -470,7 +470,7 @@ func TestAccDataflowJob_streamUpdate(t *testing.T) {
 		},
 		Steps: []resource.TestStep{
 			{
-				Config: testAccDataflowJob_updateStream(suffix, job, serviceAccount, "google_storage_bucket.bucket1.url"),
+				Config: testAccDataflowJob_stream(suffix, job, serviceAccount, "google_storage_bucket.bucket1.url", "cancel"),
 				Check: resource.ComposeTestCheckFunc(
 					testAccDataflowJobExists(t, "google_dataflow_job.pubsub_stream"),
 					func(s *terraform.State) error {
@@ -496,7 +496,7 @@ func TestAccDataflowJob_streamUpdate(t *testing.T) {
 				),
 			},
 			{
-				Config: testAccDataflowJob_updateStream(suffix, job, serviceAccount, "google_storage_bucket.bucket2.url"),
+				Config: testAccDataflowJob_stream(suffix, job, serviceAccount, "google_storage_bucket.bucket2.url", "cancel"),
 				Check: resource.ComposeTestCheckFunc(
 					testAccDataflowJobHasTempLocation(t, "google_dataflow_job.pubsub_stream", "gs://tf-test-bucket2-"+suffix),
 				),
@@ -512,11 +512,14 @@ func TestAccDataflowJob_streamUpdate(t *testing.T) {
 }
 
 func TestAccDataflowJob_virtualUpdate(t *testing.T) {
-	t.Skip()
 	// Dataflow responses include serialized java classes and bash commands
 	// This makes body comparison infeasible
 	acctest.SkipIfVcr(t)
 	t.Parallel()
+
+	randStr := acctest.RandString(t, 10)
+	job := "tf-test-dataflow-job-" + randStr
+	serviceAccount := "tf-test-dataflow-sa" + randStr
 
 	suffix := acctest.RandString(t, 10)
 
@@ -526,16 +529,39 @@ func TestAccDataflowJob_virtualUpdate(t *testing.T) {
 		PreCheck:                 func() { acctest.AccTestPreCheck(t) },
 		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories(t),
 		CheckDestroy:             testAccCheckDataflowJobDestroyProducer(t),
+		ExternalProviders: map[string]resource.ExternalProvider{
+			"time": {},
+		},
 		Steps: []resource.TestStep{
 			{
-				Config: testAccDataflowJob_virtualUpdate(suffix, "drain"),
+				Config: testAccDataflowJob_stream(suffix, job, serviceAccount, "google_storage_bucket.bucket1.url", "drain"),
 				Check: resource.ComposeTestCheckFunc(
 					testAccDataflowJobExists(t, "google_dataflow_job.pubsub_stream"),
 					testAccDataflowSetId(t, "google_dataflow_job.pubsub_stream", &id),
+					func(s *terraform.State) error {
+						ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+						defer cancel()
+						tick := time.NewTicker(10 * time.Second)
+						defer tick.Stop()
+						for {
+							select {
+							case <-tick.C:
+								job, err := testAccDataflowGetJob(t, s, "google_dataflow_job.pubsub_stream")
+								if err != nil {
+									return err
+								}
+								if job.CurrentState == "JOB_STATE_RUNNING" {
+									return nil
+								}
+							case <-ctx.Done():
+								return fmt.Errorf("timeout waiting for Job to reach RUNNING state")
+							}
+						}
+					},
 				),
 			},
 			{
-				Config: testAccDataflowJob_virtualUpdate(suffix, "cancel"),
+				Config: testAccDataflowJob_stream(suffix, job, serviceAccount, "google_storage_bucket.bucket1.url", "cancel"),
 				Check: resource.ComposeTestCheckFunc(
 					testAccDataflowCheckId(t, "google_dataflow_job.pubsub_stream", &id),
 					resource.TestCheckResourceAttr("google_dataflow_job.pubsub_stream", "on_delete", "cancel"),
@@ -545,7 +571,7 @@ func TestAccDataflowJob_virtualUpdate(t *testing.T) {
 				ResourceName:            "google_dataflow_job.pubsub_stream",
 				ImportState:             true,
 				ImportStateVerify:       true,
-				ImportStateVerifyIgnore: []string{"on_delete", "parameters", "skip_wait_on_job_termination", "state"},
+				ImportStateVerifyIgnore: []string{"on_delete", "parameters", "transform_name_mapping", "skip_wait_on_job_termination", "region", "state"},
 			},
 		},
 	})
@@ -1249,7 +1275,7 @@ resource "google_dataflow_job" "with_additional_experiments" {
 `, bucket, job, strings.Join(experiments, `", "`), testDataflowJobTemplateWordCountUrl, testDataflowJobSampleFileUrl)
 }
 
-func testAccDataflowJob_updateStream(suffix, job, serviceAccount, tempLocation string) string {
+func testAccDataflowJob_stream(suffix, job, serviceAccount, tempLocation, ondelete string) string {
 	return fmt.Sprintf(`
 
 data "google_project" "project" {}
@@ -1312,9 +1338,9 @@ resource "google_dataflow_job" "pubsub_stream" {
 		env = "test"
 	}
     service_account_email = google_service_account.dataflow-sa.email
-	on_delete = "cancel"
+	on_delete = "%s"
 }
-  `, suffix, suffix, suffix, serviceAccount, job, testDataflowJobTemplateTextToPubsub, tempLocation)
+  `, suffix, suffix, suffix, serviceAccount, job, testDataflowJobTemplateTextToPubsub, tempLocation, ondelete)
 }
 
 func testAccDataflowJob_virtualUpdate(suffix, onDelete string) string {
